@@ -5,9 +5,11 @@ import plotly.graph_objects as go
 import streamlit.components.v1 as components
 import joblib
 import sys
+import types
 from pathlib import Path
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
-from sklearn.model_selection import train_test_split
+
+import numpy as np
+from sklearn.base import BaseEstimator, ClassifierMixin
 
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_DIR.parent
@@ -33,7 +35,94 @@ ROAD_FEATURES = [
     "Traffic_Calming",
 ]
 
-# 预测模块固定使用 XGBoost 模型，不再回退到其他模型。
+
+
+class XGBSeverityClassifier(BaseEstimator, ClassifierMixin):
+    """
+    兼容主项目中保存的 XGBoost 严重程度预测模型。
+
+    训练阶段模型被序列化为 src.models.training.XGBSeverityClassifier。
+    该兼容类只用于让 joblib 正常反序列化同学提供的真实模型文件；
+    不会重新训练模型，也不会修改模型内部参数。
+    """
+
+    def __init__(
+        self,
+        n_estimators=300,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=3,
+        gamma=0.0,
+        reg_alpha=0.0,
+        reg_lambda=1.0,
+        random_state=42,
+        n_jobs=-1,
+    ):
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.learning_rate = learning_rate
+        self.subsample = subsample
+        self.colsample_bytree = colsample_bytree
+        self.min_child_weight = min_child_weight
+        self.gamma = gamma
+        self.reg_alpha = reg_alpha
+        self.reg_lambda = reg_lambda
+        self.random_state = random_state
+        self.n_jobs = n_jobs
+
+    def fit(self, X, y, sample_weight=None):
+        from xgboost import XGBClassifier
+
+        y_encoded = np.asarray(y) - 1
+        self.classes_ = np.array([1, 2, 3, 4])
+        self.model_ = XGBClassifier(
+            objective="multi:softprob",
+            num_class=4,
+            eval_metric="mlogloss",
+            tree_method="hist",
+            n_estimators=self.n_estimators,
+            max_depth=self.max_depth,
+            learning_rate=self.learning_rate,
+            subsample=self.subsample,
+            colsample_bytree=self.colsample_bytree,
+            min_child_weight=self.min_child_weight,
+            gamma=self.gamma,
+            reg_alpha=self.reg_alpha,
+            reg_lambda=self.reg_lambda,
+            random_state=self.random_state,
+            n_jobs=self.n_jobs,
+        )
+        self.model_.fit(X, y_encoded, sample_weight=sample_weight, verbose=False)
+        return self
+
+    def predict(self, X):
+        return self.model_.predict(X) + 1
+
+    def predict_proba(self, X):
+        return self.model_.predict_proba(X)
+
+    @property
+    def feature_importances_(self):
+        return self.model_.feature_importances_
+
+
+# 让 joblib.load 能找到原模型文件中记录的 src.models.training.XGBSeverityClassifier。
+# 这里只注册同名兼容类，不改变模型文件中的训练参数和树结构。
+_compat_src_module = types.ModuleType("src")
+_compat_src_module.__path__ = [str(APP_DIR / "src"), str(PROJECT_ROOT / "src")]
+_compat_models_module = types.ModuleType("src.models")
+_compat_models_module.__path__ = [str(APP_DIR / "src" / "models"), str(PROJECT_ROOT / "src" / "models")]
+_compat_training_module = types.ModuleType("src.models.training")
+_compat_training_module.XGBSeverityClassifier = XGBSeverityClassifier
+
+sys.modules.setdefault("src", _compat_src_module)
+sys.modules.setdefault("src.models", _compat_models_module)
+sys.modules["src.models.training"] = _compat_training_module
+
+
+# 预测模块固定使用报告对应的 XGBoost 模型，不再回退到其他模型。
 XGBOOST_MODEL_CANDIDATES = [
     PROJECT_ROOT / "models" / "XGBoost_random_search_macro_f1.joblib",
     APP_DIR / "models" / "XGBoost_random_search_macro_f1.joblib",
@@ -60,7 +149,7 @@ df = load_data()
 
 @st.cache_resource
 def load_predictor():
-    """固定加载 XGBoost 严重程度预测模型。"""
+    """固定加载报告对应的 XGBoost 严重程度预测模型。"""
     for model_path in XGBOOST_MODEL_CANDIDATES:
         if model_path.exists():
             return joblib.load(model_path), model_path
@@ -749,113 +838,6 @@ with st.container():
             elif "last_prediction_error" in st.session_state:
                 st.warning(f"概率输出失败，但分类预测已完成：{st.session_state['last_prediction_error']}")
 
-        with st.expander("查看 XGBoost 模型自测结果", expanded=False):
-            st.caption(
-                "自测指标由网页当前使用的 XGBoost 模型计算得到，用于检验该模型与当前清洗样本字段是否兼容。"
-            )
-            eval_df = df.copy()
-            eval_df["Start_Time"] = pd.to_datetime(eval_df["Start_Time"])
-            eval_df["Hour"] = eval_df["Start_Time"].dt.hour
-            eval_df["DayOfWeek"] = eval_df["Start_Time"].dt.dayofweek
-            eval_df["Month"] = eval_df["Start_Time"].dt.month
-            eval_df["IsWeekend"] = eval_df["DayOfWeek"].isin([5, 6]).astype(int)
-            eval_df["RushHour"] = eval_df["Hour"].isin([7, 8, 9, 16, 17, 18]).astype(int)
-            eval_df = add_prediction_features(eval_df)
-
-            expected_features = [
-                "Hour",
-                "DayOfWeek",
-                "Month",
-                "IsWeekend",
-                "RushHour",
-                "Start_Lat",
-                "Start_Lng",
-                "Lat_Bin",
-                "Lng_Bin",
-                "LowVisibility",
-                "HasPrecipitation",
-                "BadWeatherJunction",
-                "Temperature(F)",
-                "Humidity(%)",
-                "Visibility(mi)",
-                "Wind_Speed(mph)",
-                "Precipitation(in)",
-            ] + ROAD_FEATURES + [
-                "State",
-                "County",
-                "City",
-                "Weather_Condition",
-                "Wind_Direction",
-                "Location_Bin",
-            ]
-
-            missing_cols = [col for col in expected_features + ["Severity"] if col not in eval_df.columns]
-            if missing_cols:
-                st.error(f"当前数据缺少以下字段，无法评估模型：{missing_cols}")
-            else:
-                X = eval_df[expected_features].copy()
-                y = eval_df["Severity"].astype(int)
-                _, X_test, _, y_test = train_test_split(
-                    X,
-                    y,
-                    test_size=0.2,
-                    random_state=42,
-                    stratify=y,
-                )
-                y_pred = predictor.predict(X_test)
-                acc = accuracy_score(y_test, y_pred)
-                macro_f1 = f1_score(y_test, y_pred, average="macro", zero_division=0)
-                weighted_f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
-
-                metric_col1, metric_col2, metric_col3 = st.columns(3)
-                metric_col1.metric("Accuracy", f"{acc:.4f}")
-                metric_col2.metric("Macro F1", f"{macro_f1:.4f}")
-                metric_col3.metric("Weighted F1", f"{weighted_f1:.4f}")
-                st.caption(
-                    "说明：该自测使用清洗样本按 random_state=42 重新划分测试集，"
-                    "用于确认网页中的 XGBoost 模型与当前数据字段兼容。正式报告指标以 "
-                    "`outputs/reports/metrics_summary.csv` 为准。"
-                )
-
-                labels = [1, 2, 3, 4]
-                cm = confusion_matrix(y_test, y_pred, labels=labels)
-                cm_df = pd.DataFrame(
-                    cm,
-                    index=[f"真实 {i}" for i in labels],
-                    columns=[f"预测 {i}" for i in labels],
-                )
-                fig_cm = px.imshow(
-                    cm_df,
-                    text_auto=True,
-                    color_continuous_scale="Reds",
-                    title="Severity 预测混淆矩阵",
-                )
-                fig_cm.update_layout(xaxis_title="预测类别", yaxis_title="真实类别")
-                st.plotly_chart(fig_cm, width="stretch")
-
-                sample_result = X_test.copy()
-                sample_result["真实 Severity"] = y_test.values
-                sample_result["预测 Severity"] = y_pred
-                sample_result["是否预测正确"] = sample_result["真实 Severity"] == sample_result["预测 Severity"]
-                st.dataframe(
-                    sample_result[
-                        [
-                            "State",
-                            "County",
-                            "City",
-                            "Weather_Condition",
-                            "Hour",
-                            "Month",
-                            "Start_Lat",
-                            "Start_Lng",
-                            "真实 Severity",
-                            "预测 Severity",
-                            "是否预测正确",
-                        ]
-                    ].head(30),
-                    width="stretch",
-                    hide_index=True,
-                )
 
 
 # ── 底部 ──
