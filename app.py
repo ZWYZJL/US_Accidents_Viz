@@ -2,13 +2,42 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import streamlit.components.v1 as components
 import joblib
+import sys
 from pathlib import Path
-
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+
+APP_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = APP_DIR.parent
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(1, str(PROJECT_ROOT))
 
 st.set_page_config(page_title="交通事故数据可视化", layout="wide")
+
+ROAD_FEATURES = [
+    "Amenity",
+    "Crossing",
+    "Junction",
+    "Stop",
+    "Traffic_Signal",
+    "Bump",
+    "Give_Way",
+    "No_Exit",
+    "Railway",
+    "Roundabout",
+    "Station",
+    "Traffic_Calming",
+]
+
+MODEL_CANDIDATES = [
+    PROJECT_ROOT / "models" / "XGBoost_random_search_macro_f1.joblib",
+    APP_DIR / "models" / "XGBoost_random_search_macro_f1.joblib",
+    APP_DIR / "models" / "severity_predictor.joblib",
+]
 
 # ── 读取数据 ──
 @st.cache_data
@@ -28,15 +57,34 @@ def load_data():
 
 df = load_data()
 
-# ── 读取交互式预测模型 ──
+
 @st.cache_resource
 def load_predictor():
-    model_path = Path("models/severity_predictor.joblib")
-    if not model_path.exists():
-        return None
-    return joblib.load(model_path)
+    for model_path in MODEL_CANDIDATES:
+        if model_path.exists():
+            return joblib.load(model_path), model_path
+    return None, None
 
-predictor = load_predictor()
+
+def most_common_value(data: pd.DataFrame, column: str, fallback: str = "Unknown") -> str:
+    values = data[column].dropna() if column in data.columns else pd.Series(dtype=object)
+    if values.empty:
+        return fallback
+    return str(values.mode().iloc[0])
+
+
+def add_prediction_features(data: pd.DataFrame) -> pd.DataFrame:
+    data = data.copy()
+    data["Lat_Bin"] = (data["Start_Lat"] * 10).apply(lambda x: int(x // 1) / 10)
+    data["Lng_Bin"] = (data["Start_Lng"] * 10).apply(lambda x: int(x // 1) / 10)
+    data["Location_Bin"] = data["Lat_Bin"].round(1).astype(str) + "_" + data["Lng_Bin"].round(1).astype(str)
+    data["LowVisibility"] = (data["Visibility(mi)"] < 2.0).astype(int)
+    data["HasPrecipitation"] = (data["Precipitation(in)"] > 0).astype(int)
+    data["BadWeatherJunction"] = ((data["Visibility(mi)"] < 2.0) & (data["Junction"] == 1)).astype(int)
+    return data
+
+
+predictor, predictor_path = load_predictor()
 
 # ── 侧边栏 ──
 st.sidebar.header("🔍 筛选条件")
@@ -438,7 +486,7 @@ with st.container():
         with tab:
             with open(path, "r", encoding="utf-8") as f:
                 html_content = f.read()
-            st.iframe(html_content, height=600)
+            components.html(html_content, height=600, scrolling=True)
 
     # ── MiniBatchKMeans 聚类地图 ──
     st.markdown("#### MiniBatchKMeans 聚类")
@@ -452,7 +500,7 @@ with st.container():
         with tab:
             with open(path, "r", encoding="utf-8") as f:
                 html_content = f.read()
-            st.iframe(html_content, height=600)
+            components.html(html_content, height=600, scrolling=True)
 
 st.divider()
 
@@ -520,418 +568,300 @@ with st.container():
 
 st.divider()
 
-# =========================================================
-# 事故严重程度预测模块：使用 st.form，避免每改一个参数就刷新
-# =========================================================
-st.markdown("---")
-st.header("🧠 事故严重程度预测")
+# ── 8. 事故严重程度预测 ──
+with st.container():
+    st.subheader("🧠 8. 事故严重程度预测")
+    st.markdown(
+        "输入事故发生时可获得的时间、天气、道路和地理条件，"
+        "系统会调用已训练的分类模型预测可能的 `Severity` 等级。"
+    )
 
-st.markdown(
-    "输入事故发生时的时间、天气、道路环境和地理位置等条件，"
-    "系统将调用训练好的分类模型预测该事故可能对应的 Severity 等级。"
-)
+    if predictor is None:
+        st.warning(
+            "未检测到预测模型文件。可在主项目中运行训练脚本生成 "
+            "`models/XGBoost_random_search_macro_f1.joblib` 后再使用本模块。"
+        )
+    else:
+        st.caption(f"当前加载模型：`{predictor_path}`")
 
-if predictor is None:
-    st.warning("未检测到模型文件：models/severity_predictor.joblib。请先运行 train_predictor_for_app.py 生成模型。")
-else:
-    with st.form("severity_prediction_form", clear_on_submit=False):
-        st.subheader("1. 基本事故条件")
+        with st.form("severity_prediction_form", clear_on_submit=False):
+            st.markdown("##### 基本事故条件")
+            col1, col2, col3 = st.columns(3)
 
-        col1, col2, col3 = st.columns(3)
+            with col1:
+                state = st.selectbox("州 State", sorted(df["State"].dropna().astype(str).unique()))
+                state_df = df[df["State"].astype(str) == state]
+                county_options = sorted(state_df["County"].dropna().astype(str).unique())
+                city_options = sorted(state_df["City"].dropna().astype(str).unique())
+                county = st.selectbox(
+                    "县 County",
+                    county_options if county_options else [most_common_value(df, "County")],
+                )
+                city = st.selectbox(
+                    "城市 City",
+                    city_options if city_options else [most_common_value(df, "City")],
+                )
 
-        with col1:
-            state = st.selectbox(
-                "州 State",
-                sorted(df["State"].dropna().unique()),
-                key="form_pred_state"
+            with col2:
+                weather = st.selectbox("天气 Weather Condition", sorted(df["Weather_Condition"].dropna().astype(str).unique()))
+                wind_direction = st.selectbox("风向 Wind Direction", sorted(df["Wind_Direction"].dropna().astype(str).unique()))
+                dayofweek = st.slider("星期 DayOfWeek（0=周一，6=周日）", 0, 6, 1)
+
+            with col3:
+                hour = st.slider("事故发生小时 Hour", 0, 23, 8)
+                month = st.slider("月份 Month", 1, 12, 6)
+                rush_hour = int(hour in [7, 8, 9, 16, 17, 18])
+
+            st.markdown("##### 地理与天气数值条件")
+            geo_weather_cols = st.columns(7)
+            with geo_weather_cols[0]:
+                lat = st.number_input("纬度 Start_Lat", value=float(df["Start_Lat"].median()), format="%.6f")
+            with geo_weather_cols[1]:
+                lng = st.number_input("经度 Start_Lng", value=float(df["Start_Lng"].median()), format="%.6f")
+            with geo_weather_cols[2]:
+                temp = st.number_input("温度 Temperature(F)", value=60.0)
+            with geo_weather_cols[3]:
+                humidity = st.number_input("湿度 Humidity(%)", value=60.0)
+            with geo_weather_cols[4]:
+                visibility = st.number_input("能见度 Visibility(mi)", value=10.0)
+            with geo_weather_cols[5]:
+                wind_speed = st.number_input("风速 Wind Speed(mph)", value=5.0)
+            with geo_weather_cols[6]:
+                precipitation = st.number_input("降水量 Precipitation(in)", value=0.0)
+
+            st.markdown("##### 道路环境特征")
+            road_col1, road_col2, road_col3, road_col4 = st.columns(4)
+            with road_col1:
+                amenity = st.checkbox("Amenity 公共设施")
+                crossing = st.checkbox("Crossing 人行横道")
+                junction = st.checkbox("Junction 交叉口")
+            with road_col2:
+                stop = st.checkbox("Stop 停车标志")
+                traffic_signal = st.checkbox("Traffic Signal 信号灯")
+                bump = st.checkbox("Bump 减速带")
+            with road_col3:
+                give_way = st.checkbox("Give Way 让行")
+                no_exit = st.checkbox("No Exit 无出口")
+                railway = st.checkbox("Railway 铁路")
+            with road_col4:
+                roundabout = st.checkbox("Roundabout 环岛")
+                station = st.checkbox("Station 车站")
+                traffic_calming = st.checkbox("Traffic Calming 交通缓行设施")
+
+            submitted = st.form_submit_button("预测事故严重程度", type="primary")
+
+        if submitted:
+            input_data = pd.DataFrame(
+                [
+                    {
+                        "Hour": hour,
+                        "DayOfWeek": dayofweek,
+                        "Month": month,
+                        "IsWeekend": int(dayofweek in [5, 6]),
+                        "RushHour": rush_hour,
+                        "Start_Lat": lat,
+                        "Start_Lng": lng,
+                        "Temperature(F)": temp,
+                        "Humidity(%)": humidity,
+                        "Visibility(mi)": visibility,
+                        "Wind_Speed(mph)": wind_speed,
+                        "Precipitation(in)": precipitation,
+                        "Amenity": int(amenity),
+                        "Crossing": int(crossing),
+                        "Junction": int(junction),
+                        "Stop": int(stop),
+                        "Traffic_Signal": int(traffic_signal),
+                        "Bump": int(bump),
+                        "Give_Way": int(give_way),
+                        "No_Exit": int(no_exit),
+                        "Railway": int(railway),
+                        "Roundabout": int(roundabout),
+                        "Station": int(station),
+                        "Traffic_Calming": int(traffic_calming),
+                        "State": state,
+                        "County": county,
+                        "City": city,
+                        "Weather_Condition": weather,
+                        "Wind_Direction": wind_direction,
+                    }
+                ]
             )
+            input_data = add_prediction_features(input_data)
 
-            weather = st.selectbox(
-                "天气 Weather Condition",
-                sorted(df["Weather_Condition"].dropna().unique()),
-                key="form_pred_weather"
-            )
-
-            wind_direction = st.selectbox(
-                "风向 Wind Direction",
-                sorted(df["Wind_Direction"].dropna().unique()),
-                key="form_pred_wind_direction"
-            )
-
-        with col2:
-            hour = st.slider(
-                "事故发生小时 Hour",
-                min_value=0,
-                max_value=23,
-                value=8,
-                key="form_pred_hour"
-            )
-
-            month = st.slider(
-                "月份 Month",
-                min_value=1,
-                max_value=12,
-                value=6,
-                key="form_pred_month"
-            )
-
-            dayofweek = st.slider(
-                "星期 DayOfWeek（0=周一，6=周日）",
-                min_value=0,
-                max_value=6,
-                value=1,
-                key="form_pred_dayofweek"
-            )
-
-        with col3:
-            lat = st.number_input(
-                "纬度 Start_Lat",
-                value=float(df["Start_Lat"].median()),
-                format="%.6f",
-                key="form_pred_lat"
-            )
-
-            lng = st.number_input(
-                "经度 Start_Lng",
-                value=float(df["Start_Lng"].median()),
-                format="%.6f",
-                key="form_pred_lng"
-            )
-
-        st.subheader("2. 天气数值条件")
-
-        weather_col1, weather_col2, weather_col3, weather_col4, weather_col5 = st.columns(5)
-
-        with weather_col1:
-            temp = st.number_input(
-                "温度 Temperature(F)",
-                value=60.0,
-                key="form_pred_temp"
-            )
-
-        with weather_col2:
-            humidity = st.number_input(
-                "湿度 Humidity(%)",
-                value=60.0,
-                key="form_pred_humidity"
-            )
-
-        with weather_col3:
-            visibility = st.number_input(
-                "能见度 Visibility(mi)",
-                value=10.0,
-                key="form_pred_visibility"
-            )
-
-        with weather_col4:
-            wind_speed = st.number_input(
-                "风速 Wind Speed(mph)",
-                value=5.0,
-                key="form_pred_wind_speed"
-            )
-
-        with weather_col5:
-            precipitation = st.number_input(
-                "降水量 Precipitation(in)",
-                value=0.0,
-                key="form_pred_precipitation"
-            )
-
-        st.subheader("3. 道路环境特征")
-
-        road_col1, road_col2, road_col3, road_col4 = st.columns(4)
-
-        with road_col1:
-            amenity = st.checkbox("Amenity 公共设施", key="form_pred_amenity")
-            bump = st.checkbox("Bump 减速带", key="form_pred_bump")
-            crossing = st.checkbox("Crossing 人行横道", key="form_pred_crossing")
-
-        with road_col2:
-            give_way = st.checkbox("Give Way 让行", key="form_pred_give_way")
-            junction = st.checkbox("Junction 交叉口", key="form_pred_junction")
-            no_exit = st.checkbox("No Exit 无出口", key="form_pred_no_exit")
-
-        with road_col3:
-            railway = st.checkbox("Railway 铁路", key="form_pred_railway")
-            roundabout = st.checkbox("Roundabout 环岛", key="form_pred_roundabout")
-            station = st.checkbox("Station 车站", key="form_pred_station")
-
-        with road_col4:
-            stop = st.checkbox("Stop 停车标志", key="form_pred_stop")
-            traffic_calming = st.checkbox("Traffic Calming 交通缓行设施", key="form_pred_traffic_calming")
-            traffic_signal = st.checkbox("Traffic Signal 信号灯", key="form_pred_traffic_signal")
-
-        submitted = st.form_submit_button("预测事故严重程度", type="primary")
-
-    # 注意：预测逻辑写在 form 外面，但由 submitted 控制
-    if submitted:
-        input_data = pd.DataFrame([{
-            "Start_Lat": lat,
-            "Start_Lng": lng,
-            "Temperature(F)": temp,
-            "Humidity(%)": humidity,
-            "Visibility(mi)": visibility,
-            "Wind_Speed(mph)": wind_speed,
-            "Precipitation(in)": precipitation,
-            "Hour": hour,
-            "Month": month,
-            "DayOfWeek": dayofweek,
-            "IsWeekend": int(dayofweek in [5, 6]),
-            "RushHour": int(hour in [7, 8, 9, 17, 18, 19]),
-            "State": state,
-            "Weather_Condition": weather,
-            "Wind_Direction": wind_direction,
-            "Amenity": int(amenity),
-            "Bump": int(bump),
-            "Crossing": int(crossing),
-            "Give_Way": int(give_way),
-            "Junction": int(junction),
-            "No_Exit": int(no_exit),
-            "Railway": int(railway),
-            "Roundabout": int(roundabout),
-            "Station": int(station),
-            "Stop": int(stop),
-            "Traffic_Calming": int(traffic_calming),
-            "Traffic_Signal": int(traffic_signal),
-        }])
-
-        pred = predictor.predict(input_data)[0]
-
-        severity_explain = {
-            1: "轻微影响事故",
-            2: "一般影响事故",
-            3: "较严重影响事故",
-            4: "严重影响事故"
-        }
-
-        st.session_state["last_prediction"] = int(pred)
-        st.session_state["last_prediction_explain"] = severity_explain.get(int(pred), "未知等级")
-
-        try:
-            proba = predictor.predict_proba(input_data)[0]
-            classes = predictor.classes_
-
-            proba_df = pd.DataFrame({
-                "Severity": classes,
-                "Probability": proba
-            })
-
-            st.session_state["last_prediction_proba"] = proba_df
-
-        except Exception as e:
-            st.session_state["last_prediction_proba"] = None
-            st.session_state["last_prediction_error"] = str(e)
-
-    # 预测结果展示区：点击按钮后才出现
-    if "last_prediction" in st.session_state:
-        st.subheader("4. 预测结果")
-
-        st.success(f"预测结果：Severity = {st.session_state['last_prediction']}")
-        st.info(f"结果解释：模型判断该事故更可能属于「{st.session_state['last_prediction_explain']}」。")
-
-        proba_df = st.session_state.get("last_prediction_proba")
-
-        if proba_df is not None:
-            # 保持与原网页一致的红色系风格
-            proba_df_plot = proba_df.copy()
-            proba_df_plot["Severity"] = proba_df_plot["Severity"].astype(str)
-
-            severity_color_map = {
-                "1": "#ff4b4b",
-                "2": "#e03131",
-                "3": "#c1121f",
-                "4": "#7f0000",
+            pred = int(predictor.predict(input_data)[0])
+            severity_explain = {
+                1: "轻微影响事故",
+                2: "一般影响事故",
+                3: "较严重影响事故",
+                4: "严重影响事故",
             }
 
-            fig = px.bar(
-                proba_df_plot,
-                x="Severity",
-                y="Probability",
-                color="Severity",
-                color_discrete_map=severity_color_map,
-                category_orders={"Severity": ["1", "2", "3", "4"]},
-                text=proba_df_plot["Probability"].apply(lambda x: f"{x:.2%}"),
-                title="各 Severity 等级预测概率"
-            )
-
-            fig.update_traces(
-                textposition="inside",
-                textfont_color="white",
-                marker_line_color="white",
-                marker_line_width=1
-            )
-
-            fig.update_layout(
-                yaxis_tickformat=".0%",
-                xaxis_title="Severity 等级",
-                yaxis_title="预测概率",
-                showlegend=False
-            )
-
-            st.plotly_chart(fig, use_container_width=True)
-
-        else:
-            if "last_prediction_error" in st.session_state:
-                st.warning(
-                    f"概率输出失败，但分类预测已完成。错误信息：{st.session_state['last_prediction_error']}"
+            st.session_state["last_prediction"] = pred
+            st.session_state["last_prediction_explain"] = severity_explain.get(pred, "未知等级")
+            try:
+                proba = predictor.predict_proba(input_data)[0]
+                classes = getattr(predictor, "classes_", [1, 2, 3, 4])
+                st.session_state["last_prediction_proba"] = pd.DataFrame(
+                    {"Severity": classes, "Probability": proba}
                 )
-           
+            except Exception as exc:
+                st.session_state["last_prediction_proba"] = None
+                st.session_state["last_prediction_error"] = str(exc)
+
+        if "last_prediction" in st.session_state:
+            st.markdown("##### 预测结果")
+            st.success(f"预测结果：Severity = {st.session_state['last_prediction']}")
+            st.info(f"结果解释：模型判断该事故更可能属于「{st.session_state['last_prediction_explain']}」。")
+
+            proba_df = st.session_state.get("last_prediction_proba")
+            if proba_df is not None:
+                proba_df_plot = proba_df.copy()
+                proba_df_plot["Severity"] = proba_df_plot["Severity"].astype(str)
+                fig_pred = px.bar(
+                    proba_df_plot,
+                    x="Severity",
+                    y="Probability",
+                    color="Severity",
+                    color_discrete_map={
+                        "1": "#ff4b4b",
+                        "2": "#e03131",
+                        "3": "#c1121f",
+                        "4": "#7f0000",
+                    },
+                    category_orders={"Severity": ["1", "2", "3", "4"]},
+                    text=proba_df_plot["Probability"].apply(lambda x: f"{x:.2%}"),
+                    title="各 Severity 等级预测概率",
+                )
+                fig_pred.update_traces(
+                    textposition="inside",
+                    textfont_color="white",
+                    marker_line_color="white",
+                    marker_line_width=1,
+                )
+                fig_pred.update_layout(
+                    yaxis_tickformat=".0%",
+                    xaxis_title="Severity 等级",
+                    yaxis_title="预测概率",
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_pred, width="stretch")
+            elif "last_prediction_error" in st.session_state:
+                st.warning(f"概率输出失败，但分类预测已完成：{st.session_state['last_prediction_error']}")
+
+        with st.expander("查看预测模型自测结果", expanded=False):
+            st.caption(
+                "自测指标由当前实际加载的模型计算得到；如果部署环境加载了不同的模型文件，"
+                "这里的 Accuracy/Macro F1 会和报告中的 XGBoost 指标不同。"
+            )
+            eval_df = df.copy()
+            eval_df["Start_Time"] = pd.to_datetime(eval_df["Start_Time"])
+            eval_df["Hour"] = eval_df["Start_Time"].dt.hour
+            eval_df["DayOfWeek"] = eval_df["Start_Time"].dt.dayofweek
+            eval_df["Month"] = eval_df["Start_Time"].dt.month
+            eval_df["IsWeekend"] = eval_df["DayOfWeek"].isin([5, 6]).astype(int)
+            eval_df["RushHour"] = eval_df["Hour"].isin([7, 8, 9, 16, 17, 18]).astype(int)
+            eval_df = add_prediction_features(eval_df)
+
+            expected_features = [
+                "Hour",
+                "DayOfWeek",
+                "Month",
+                "IsWeekend",
+                "RushHour",
+                "Start_Lat",
+                "Start_Lng",
+                "Lat_Bin",
+                "Lng_Bin",
+                "LowVisibility",
+                "HasPrecipitation",
+                "BadWeatherJunction",
+                "Temperature(F)",
+                "Humidity(%)",
+                "Visibility(mi)",
+                "Wind_Speed(mph)",
+                "Precipitation(in)",
+            ] + ROAD_FEATURES + [
+                "State",
+                "County",
+                "City",
+                "Weather_Condition",
+                "Wind_Direction",
+                "Location_Bin",
+            ]
+
+            missing_cols = [col for col in expected_features + ["Severity"] if col not in eval_df.columns]
+            if missing_cols:
+                st.error(f"当前数据缺少以下字段，无法评估模型：{missing_cols}")
+            else:
+                X = eval_df[expected_features].copy()
+                y = eval_df["Severity"].astype(int)
+                _, X_test, _, y_test = train_test_split(
+                    X,
+                    y,
+                    test_size=0.2,
+                    random_state=42,
+                    stratify=y,
+                )
+                y_pred = predictor.predict(X_test)
+                acc = accuracy_score(y_test, y_pred)
+                macro_f1 = f1_score(y_test, y_pred, average="macro", zero_division=0)
+                weighted_f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
+
+                metric_col1, metric_col2, metric_col3 = st.columns(3)
+                metric_col1.metric("Accuracy", f"{acc:.4f}")
+                metric_col2.metric("Macro F1", f"{macro_f1:.4f}")
+                metric_col3.metric("Weighted F1", f"{weighted_f1:.4f}")
+                st.caption(
+                    "说明：该自测使用清洗样本按 random_state=42 重新划分测试集，"
+                    "用于确认网页加载的模型与当前数据字段兼容。正式报告指标以 "
+                    "`outputs/reports/metrics_summary.csv` 为准。"
+                )
+
+                labels = [1, 2, 3, 4]
+                cm = confusion_matrix(y_test, y_pred, labels=labels)
+                cm_df = pd.DataFrame(
+                    cm,
+                    index=[f"真实 {i}" for i in labels],
+                    columns=[f"预测 {i}" for i in labels],
+                )
+                fig_cm = px.imshow(
+                    cm_df,
+                    text_auto=True,
+                    color_continuous_scale="Reds",
+                    title="Severity 预测混淆矩阵",
+                )
+                fig_cm.update_layout(xaxis_title="预测类别", yaxis_title="真实类别")
+                st.plotly_chart(fig_cm, width="stretch")
+
+                sample_result = X_test.copy()
+                sample_result["真实 Severity"] = y_test.values
+                sample_result["预测 Severity"] = y_pred
+                sample_result["是否预测正确"] = sample_result["真实 Severity"] == sample_result["预测 Severity"]
+                st.dataframe(
+                    sample_result[
+                        [
+                            "State",
+                            "County",
+                            "City",
+                            "Weather_Condition",
+                            "Hour",
+                            "Month",
+                            "Start_Lat",
+                            "Start_Lng",
+                            "真实 Severity",
+                            "预测 Severity",
+                            "是否预测正确",
+                        ]
+                    ].head(30),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+# ── 部署链接 ──
+st.divider()
+st.markdown("🌐 **公网展示地址：** https://usaccidentsviz-geszltpxcfaf5gpl7hwg75.streamlit.app/")
 
 # ── 底部 ──
 st.divider()
 st.markdown(f"*数据最后更新：{dff['Start_Time'].max().strftime('%Y-%m-%d')}　｜　数据记录数：{len(dff):,}*")
 st.caption("数据来源：US Accidents 数据集")
-
-# =========================================================
-# 模型准确率自测模块
-# =========================================================
-st.markdown("---")
-st.header("📊 预测模型准确率自测")
-
-st.markdown(
-    "该模块使用清洗后的样本数据重新划分测试集，"
-    "调用已保存的 Severity 预测模型进行批量预测，"
-    "并计算 Accuracy、Macro F1、Weighted F1 和混淆矩阵。"
-)
-
-if predictor is None:
-    st.warning("未检测到模型文件：models/severity_predictor.joblib，无法进行模型自测。")
-else:
-    with st.expander("点击展开模型自测结果", expanded=False):
-
-        # 和训练脚本保持一致的特征构造
-        eval_df = df.copy()
-        eval_df["Start_Time"] = pd.to_datetime(eval_df["Start_Time"])
-
-        eval_df["Hour"] = eval_df["Start_Time"].dt.hour
-        eval_df["Month"] = eval_df["Start_Time"].dt.month
-        eval_df["DayOfWeek"] = eval_df["Start_Time"].dt.dayofweek
-        eval_df["IsWeekend"] = eval_df["DayOfWeek"].isin([5, 6]).astype(int)
-        eval_df["RushHour"] = eval_df["Hour"].isin([7, 8, 9, 17, 18, 19]).astype(int)
-
-        target = "Severity"
-
-        numeric_features = [
-            "Start_Lat",
-            "Start_Lng",
-            "Temperature(F)",
-            "Humidity(%)",
-            "Visibility(mi)",
-            "Wind_Speed(mph)",
-            "Precipitation(in)",
-            "Hour",
-            "Month",
-            "DayOfWeek",
-            "IsWeekend",
-            "RushHour",
-        ]
-
-        categorical_features = [
-            "State",
-            "Weather_Condition",
-            "Wind_Direction",
-        ]
-
-        binary_features = [
-            "Amenity",
-            "Bump",
-            "Crossing",
-            "Give_Way",
-            "Junction",
-            "No_Exit",
-            "Railway",
-            "Roundabout",
-            "Station",
-            "Stop",
-            "Traffic_Calming",
-            "Traffic_Signal",
-        ]
-
-        features = numeric_features + categorical_features + binary_features
-
-        missing_cols = [col for col in features + [target] if col not in eval_df.columns]
-
-        if missing_cols:
-            st.error(f"当前数据缺少以下字段，无法评估模型：{missing_cols}")
-        else:
-            eval_df = eval_df.dropna(subset=[target])
-
-            X = eval_df[features].copy()
-            y = eval_df[target].astype(int)
-
-            # 和训练脚本保持相同划分方式
-            _, X_test, _, y_test = train_test_split(
-                X,
-                y,
-                test_size=0.2,
-                random_state=42,
-                stratify=y
-            )
-
-            y_pred = predictor.predict(X_test)
-
-            acc = accuracy_score(y_test, y_pred)
-            macro_f1 = f1_score(y_test, y_pred, average="macro")
-            weighted_f1 = f1_score(y_test, y_pred, average="weighted")
-
-            col_a, col_b, col_c = st.columns(3)
-
-            col_a.metric("Accuracy", f"{acc:.4f}")
-            col_b.metric("Macro F1", f"{macro_f1:.4f}")
-            col_c.metric("Weighted F1", f"{weighted_f1:.4f}")
-
-            st.caption(
-                "说明：Accuracy 表示整体预测正确率；Macro F1 更关注各类别均衡表现；"
-                "Weighted F1 按类别样本量加权，更接近整体样本分布下的综合效果。"
-            )
-
-            # 混淆矩阵
-            labels = sorted(y.unique())
-            cm = confusion_matrix(y_test, y_pred, labels=labels)
-
-            cm_df = pd.DataFrame(
-                cm,
-                index=[f"真实 {i}" for i in labels],
-                columns=[f"预测 {i}" for i in labels]
-            )
-
-            st.subheader("混淆矩阵")
-
-            fig_cm = px.imshow(
-                cm_df,
-                text_auto=True,
-                color_continuous_scale="Reds",
-                title="Severity 预测混淆矩阵"
-            )
-
-            fig_cm.update_layout(
-                xaxis_title="预测类别",
-                yaxis_title="真实类别"
-            )
-
-            st.plotly_chart(fig_cm, use_container_width=True)
-
-            # 展示部分预测样例
-            st.subheader("部分测试样本预测结果")
-
-            sample_result = X_test.copy()
-            sample_result["真实 Severity"] = y_test.values
-            sample_result["预测 Severity"] = y_pred
-            sample_result["是否预测正确"] = sample_result["真实 Severity"] == sample_result["预测 Severity"]
-
-            display_cols = [
-                "State",
-                "Weather_Condition",
-                "Hour",
-                "Month",
-                "Start_Lat",
-                "Start_Lng",
-                "真实 Severity",
-                "预测 Severity",
-                "是否预测正确"
-            ]
-
-            st.dataframe(
-                sample_result[display_cols].head(30),
-                use_container_width=True
-            )
