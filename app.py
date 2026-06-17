@@ -33,10 +33,10 @@ ROAD_FEATURES = [
     "Traffic_Calming",
 ]
 
-MODEL_CANDIDATES = [
+# 预测模块固定使用 XGBoost 模型，不再回退到其他模型。
+XGBOOST_MODEL_CANDIDATES = [
     PROJECT_ROOT / "models" / "XGBoost_random_search_macro_f1.joblib",
     APP_DIR / "models" / "XGBoost_random_search_macro_f1.joblib",
-    APP_DIR / "models" / "severity_predictor.joblib",
 ]
 
 # ── 读取数据 ──
@@ -60,7 +60,8 @@ df = load_data()
 
 @st.cache_resource
 def load_predictor():
-    for model_path in MODEL_CANDIDATES:
+    """固定加载 XGBoost 严重程度预测模型。"""
+    for model_path in XGBOOST_MODEL_CANDIDATES:
         if model_path.exists():
             return joblib.load(model_path), model_path
     return None, None
@@ -573,16 +574,16 @@ with st.container():
     st.subheader("🧠 8. 事故严重程度预测")
     st.markdown(
         "输入事故发生时可获得的时间、天气、道路和地理条件，"
-        "系统会调用已训练的分类模型预测可能的 `Severity` 等级。"
+        "系统会调用已训练的 XGBoost 模型预测可能的 `Severity` 等级。"
     )
 
     if predictor is None:
         st.warning(
-            "未检测到预测模型文件。可在主项目中运行训练脚本生成 "
-            "`models/XGBoost_random_search_macro_f1.joblib` 后再使用本模块。"
+            "未检测到 XGBoost 预测模型文件。请先生成并上传 "
+            "`XGBoost_random_search_macro_f1.joblib` 后再使用本模块。"
         )
     else:
-        st.caption(f"当前加载模型：`{predictor_path}`")
+        st.caption("当前预测模型：XGBoost（Random Search / Macro F1 优化模型）")
 
         with st.form("severity_prediction_form", clear_on_submit=False):
             st.markdown("##### 基本事故条件")
@@ -748,10 +749,9 @@ with st.container():
             elif "last_prediction_error" in st.session_state:
                 st.warning(f"概率输出失败，但分类预测已完成：{st.session_state['last_prediction_error']}")
 
-        with st.expander("查看预测模型自测结果", expanded=False):
+        with st.expander("查看 XGBoost 模型自测结果", expanded=False):
             st.caption(
-                "自测指标由当前实际加载的模型计算得到；如果部署环境加载了不同的模型文件，"
-                "这里的 Accuracy/Macro F1 会和报告中的 XGBoost 指标不同。"
+                "自测指标由网页当前使用的 XGBoost 模型计算得到，用于检验该模型与当前清洗样本字段是否兼容。"
             )
             eval_df = df.copy()
             eval_df["Start_Time"] = pd.to_datetime(eval_df["Start_Time"])
@@ -813,7 +813,7 @@ with st.container():
                 metric_col3.metric("Weighted F1", f"{weighted_f1:.4f}")
                 st.caption(
                     "说明：该自测使用清洗样本按 random_state=42 重新划分测试集，"
-                    "用于确认网页加载的模型与当前数据字段兼容。正式报告指标以 "
+                    "用于确认网页中的 XGBoost 模型与当前数据字段兼容。正式报告指标以 "
                     "`outputs/reports/metrics_summary.csv` 为准。"
                 )
 
@@ -857,9 +857,6 @@ with st.container():
                     hide_index=True,
                 )
 
-# ── 部署链接 ──
-st.divider()
-st.markdown("🌐 **公网展示地址：** https://usaccidentsviz-geszltpxcfaf5gpl7hwg75.streamlit.app/")
 
 # ── 底部 ──
 st.divider()
